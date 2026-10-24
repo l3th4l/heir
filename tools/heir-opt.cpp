@@ -123,6 +123,7 @@
 #include "lib/Transforms/LayoutPropagation/InterfaceImpl.h"
 #include "lib/Transforms/LayoutPropagation/LayoutPropagation.h"
 #include "lib/Transforms/LinalgCanonicalizations/LinalgCanonicalizations.h"
+#include "lib/Transforms/LinalgComplexifyMatmulOps/LinalgComplexifyMatmulOps.h" 
 #include "lib/Transforms/LinalgFuseLinearOps/LinalgFuseLinearOps.h"
 #include "lib/Transforms/LowerPolynomialEval/LowerPolynomialEval.h"
 #include "lib/Transforms/LowerUnpack/LowerUnpack.h"
@@ -447,6 +448,7 @@ int main(int argc, char** argv) {
   registerLayoutOptimizationPasses();
   registerLinalgCanonicalizationsPasses();
   registerLinalgFuseLinearOpsPasses();
+  registerLinalgComplexifyMatmulOpsPasses();
   registerReductionCanonicalizationsPasses();
   registerSoftmaxCanonicalizationsPass();
   registerFoldConstantTensorsPasses();
