@@ -6,6 +6,8 @@
 #include <type_traits>
 #include <utility>
 
+// TODO Remove unused includes 
+
 #include "lib/Analysis/SecretnessAnalysis/SecretnessAnalysis.h"
 #include "llvm/include/llvm/ADT/TypeSwitch.h"              // from @llvm-project
 #include "mlir/include/mlir/Analysis/DataFlow/Utils.h"     // from @llvm-project
@@ -40,86 +42,84 @@ namespace heir {
 
 namespace {
 
-// Transforms (XA)(XB)^T 
+// Transforms (XA)(YB)^T : where X and Y are secret tensors 
+// 
+// TODO This is structurally similar to (XA)(B^T)(Y^T)
+// Find other structural similarities and imilement those in
+// this rewrite pattern 
+
+
 struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::MatmulOp>{
     const DataFlowSolver *solver; 
 
     ComplexifyTransposedMultiplication(
             MLIRContext *context, 
-            const DataFlowSolver * solver): mlir::OpRewritePattern<linalg::MatmulOp>
+            const DataFlowSolver *solver)
+            : mlir::OpRewritePattern<linalg::MatmulOp>(context), 
+              solver(solver) {}
+    
+    LogicalResult matchAndRewrite(linalg::MatmulOp matmul3,
+                                  PatternRewriter &rewriter) const override{
+        
+        // get the two inputs of the outer matmuls : %lhs, %rhs, \equiv (XA), (YB)^T
+        Value lhs = matmul3.getDpsInputs()[0]; 
+        Value rhs = matmul3.getDpsInputs()[1]; 
 
+        // check that lhs is produced by a matmul
+        auto matmulXA = lhs.getDefiningOp<linalg::MatmulOp>();
+
+        if (!matmulXA){
+            return failure(); 
+        }
+
+        // check that rhs is produced by a matmul and then a transpose 
+        auto transposeYB = rhs.getDefiningOp<linalg::TransposeOp>();
+
+        if (!transposeYB){
+            return failure(); 
+        }
+
+        // check that the input to the transpose comes from a matmul 
+        Value yb = transposeYB.getDpsInputs()[0];
+
+        auto matmulYB = yb.getDefiningOp<linalg::MatmulOp>();
+
+        if (!matmulYB){
+            return failure(); 
+        }
+
+        Value X = matmulXA.getDpsInputs()[0];         
+        Value A = matmulXA.getDpsInputs()[1];
+        
+        Value Y = matmulYB.getDpsInputs()[0];         
+        Value B = matmulYB.getDpsInputs()[1];
+
+        // checks that X,Y are secret tensors and A, B aren't 
+        
+        bool xSecret = isSecret(X, solver); 
+        bool ySecret = isSecret(Y, solver);
+        
+        bool aSecret = isSecret(A, solver); 
+        bool bSecret = isSecret(B, solver);
+
+        if (!xSecret || !ySecret || aSecret || bSecret) {
+            return failure();
+        }
+
+        // TODO replace tensor ops with complexified tensors 
+
+        return failure();
+
+    }
 }
 
-// Transforms B(XA)C 
-
-
+// TODO Transforms B(XA)C 
 
 // TODO Keep on Hold until clarification of FF1 and FF2 complexification 
 // from the Tricycle paper 
 
-// Transforms AB + CD -> (A + Ci)(B - Di) : Extract the real part 
-struct ComplexifyProductProductAddition : public OpRewritePattern<arith::AddFOp>{
-    using OpRewritePattern<arith::AddFOp>::OpRewritePattern;
-
-    const DataFlowSolver *solver; 
-    
-    ComplexifyProductProductAddition(
-        MLIRContext *context,
-        const DataFlowSolver *solver)
-        : OpRewritePattern<arith::AddFOp>(context),
-          solver(solver) {}
-
-    LogicalResult matchAndRewrite(
-            arith::AddFOp add, 
-            PatternRewriter &rewriter) const override{
-
-        // Checks that AB and CD are produced by matmuls
-        auto matmulAB = add.getLhs().getDefiningOp<linalg::MatmulOp>(); 
-        auto matmulCD = add.getRhs().getDefiningOp<linalg::MatmulOp>(); 
-
-        if (!matmulAB || !matmulCD)
-            return failure();
-
-        // TODO Maybe we need additional checks 
-        Value A = matmulAB.getDpsInputs()[0]; 
-        Value B = matmulAB.getDpsInputs()[1]; 
-
-        Value C = matmulCD.getDpsInputs()[0]; 
-        Value D = matmulCD.getDpsInputs()[1];
-
-        if (!solver) 
-        {
-            return failure();
-        }
-
-        // TODO Query : Is this only done if A and C are secret tensors? 
-        // If so, then is there a better way to do the complefication than
-        // to multiply C with i 
-
-        bool aSecret = isSecret(A, solver); 
-        bool cSecret = isSecret(C, solver); 
-
-        if (!aSecret || !cSecret)
-        {
-            return failure(); 
-        }
-
-        // TODO Rewrite tensor ops
-        // multiply C with i * I whhere I is an nxn identity matrix where n 
-        // is the number of rows of C 
-        //
-        // Do the same with D
-        //
-
-        return failure();
-
-        
-
-    }
-
-}
-
-
+// TODO Transforms AB + CD -> (A + Ci)(B - Di)
+//
 }
 
 struct LinalgComplexifyMatmulOps
