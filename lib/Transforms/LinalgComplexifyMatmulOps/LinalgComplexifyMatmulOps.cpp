@@ -192,17 +192,19 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
 
         if (failed(packedAResult) || failed(packedBResult)) return failure();
 
-        Value Acomp = *packedAResult; 
+        Value Acomp = *packedAResult;
         Value Bcomp = *packedBResult;
+        ModuleOp module = matmul3->getParentOfType<ModuleOp>();
 
-        // TODO Make sure to later replace the original matrices with the new matrices 
-        // Print the packed tensors' types.
+        rewriter.replaceOp(matmul3, Acomp);
+
         llvm::errs() << "Acomp type: " << Acomp.getType() << "\n";
-        llvm::errs() << "Bcomp type: " << Bcomp.getType() << "\n";
+        llvm::errs() << "Bcomp type: " << Bcomp.getType() << "\n\n";
 
-        // Print the generated operations.
         Acomp.getDefiningOp()->dump();
         Bcomp.getDefiningOp()->dump();
+
+        module.dump();
 
         return success();
 
@@ -219,6 +221,14 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
 
 struct LinalgComplexifyMatmulOps
     : public impl::LinalgComplexifyMatmulOpsBase<LinalgComplexifyMatmulOps> {
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<
+        scf::SCFDialect,
+        tensor::TensorDialect,
+        arith::ArithDialect,
+        complex::ComplexDialect>();
+  }
   void runOnOperation() override {
     MLIRContext* context = &getContext();
     auto module = getOperation();
