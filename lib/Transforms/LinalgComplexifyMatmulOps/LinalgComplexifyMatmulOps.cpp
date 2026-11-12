@@ -43,7 +43,8 @@ namespace heir {
 
 namespace {
 
-static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &rewriter){
+static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &rewriter, 
+        bool negateImag = false){
     auto inputType = dyn_cast<RankedTensorType>(input.getType()); 
     
     // TODO Figure out what to do in case of batched matmul 
@@ -61,6 +62,9 @@ static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &
     int64_t cols = inputType.getDimSize(1);
 
     // ceil(cols/2) : accounts for odd number of columns 
+    // TODO Figure out what to do if the elements are already complex 
+    // Possibly add a check to see if the imaginary parts are all 0
+
     int64_t packedCols = (cols + 1) / 2; 
 
     auto complexType = ComplexType::get(elemType);
@@ -86,7 +90,7 @@ static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &
 
                 Value inBounds = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, secondCol, bound);
 
-                // Only extract the imaginary component when index in bounds
+                // Only extract the imaginary component when index in bounds, else set the imaginary component to 0 
                 auto ifOp = builder.create<scf::IfOp>(loc, TypeRange{elemType}, inBounds, /*withElseRegion=*/true);
                 {
                     OpBuilder::InsertionGuard guard(builder); 
@@ -107,6 +111,11 @@ static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &
 
                 Value imag = ifOp.getResult(0); 
 
+                // Optionally, negate the imaginary component
+                if (negateImag) {
+                    imag = builder.create<arith::NegFOp>(loc, imag);
+                }
+
                 Value z = builder.create<complex::CreateOp>(loc, complexType, real, imag); 
 
                 builder.create<tensor::YieldOp>(loc, z);
@@ -124,8 +133,6 @@ static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &
 // TODO This is structurally similar to (XA)(B^T)(Y^T)
 // Find other structural similarities and imilement those in
 // this rewrite pattern 
-
-
 struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::MatmulOp>{
     const DataFlowSolver *solver; 
 
@@ -187,17 +194,26 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
 
         Location loc = matmul3.getLoc(); 
 
-        FailureOr<Value> packedAResult = packColumns(loc, A, rewriter); 
-        FailureOr<Value> packedBResult = packColumns(loc, B, rewriter);  
+        FailureOr<Value> packedAResult = packColumns(loc, A, rewriter, false); 
+        FailureOr<Value> packedBResult = packColumns(loc, B, rewriter, true);  
 
         if (failed(packedAResult) || failed(packedBResult)) return failure();
 
         Value Acomp = *packedAResult;
         Value Bcomp = *packedBResult;
+
+        // Replace A with Acomp in the first matmul.
+        rewriter.modifyOpInPlace(matmulXA, [&]() {
+            matmulXA.getDpsInputsMutable()[1].assign(Acomp);
+        });
+
+        // Replace B with Bcomp in the second matmul.
+        rewriter.modifyOpInPlace(matmulYB, [&]() {
+            matmulYB.getDpsInputsMutable()[1].assign(Bcomp);
+        });
+
         ModuleOp module = matmul3->getParentOfType<ModuleOp>();
-
-        rewriter.replaceOp(matmul3, Acomp);
-
+        
         llvm::errs() << "Acomp type: " << Acomp.getType() << "\n";
         llvm::errs() << "Bcomp type: " << Bcomp.getType() << "\n\n";
 
@@ -206,17 +222,21 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
 
         module.dump();
 
+        // TODO we need to propagate the shape and type of the modified operations 
+        // since the input and output types and shapes of future operators might 
+        // have to be changed. 
+
         return success();
 
     }
 };
 
-// TODO Transforms B(XA)C 
+// TODO Transforms B(XA)C : Free Attenetion Complexification
 
-// TODO Keep on Hold until clarification of FF1 and FF2 complexification 
-// from the Tricycle paper 
 
 // TODO Transforms AB + CD -> (A + Ci)(B - Di)
+// TODO Keep on Hold until clarification of FF1 and FF2 complexification 
+// from the Tricycle paper 
 }
 
 struct LinalgComplexifyMatmulOps
