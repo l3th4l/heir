@@ -43,6 +43,35 @@ namespace heir {
 
 namespace {
 
+// Why not FailureOr? 
+static Value conjugateTensor(Location loc, Value input, PatternRewriter &rewriter){
+    auto inputType = cast<RankedTensorType>(input.getType()); // why not dyn_cast? 
+    auto outputType = inputType; 
+    
+    // What does this do? 
+    auto result = rewriter.create<tensor::EmptyOp>(loc, outputType.getShape(), outputType.getElementType());
+
+    auto zero = rewriter.create<arith::ConstantOp>(loc, outputType, 
+            DenseElementsAttr::get(outputType, rewriter.getZeroAttr(outputType.getElementType()))); 
+
+    // Using linalg.generic to apply complex.conj element wise. Look up the working of linalg.generic 
+    SmallVector<utils::IteratorType> iteratorTypes(inputType.getRank(), utils::IteratorType::parallel); // what does this do?
+
+    SmallVector<AffineMap> indexingMaps = {
+        rewriter.getMultiDimIdentityMap(inputType.getRank()), 
+        rewriter.getMultiDimIdentityMap(inputType.getRank())
+    } // check what  this does 
+    
+    auto generic = rewriter.create<linalg::GenericOp>(loc, outputType, ValueRange{input}, ValueRange{zero},
+            indexingMaps, iteratorTypes, 
+            [&](OpBuilder &builder, Location loc, ValueRange args){
+                Value conj == builder.create<complex::ConjOp>(loc, args[0]);
+                builder.create<linalg::YieldOp>(loc, conj);
+            });
+
+    return generic.getResult(0);
+}
+
 static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &rewriter, 
         bool negateImag = false){
     auto inputType = dyn_cast<RankedTensorType>(input.getType()); 
