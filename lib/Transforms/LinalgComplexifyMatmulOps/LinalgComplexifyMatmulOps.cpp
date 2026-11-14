@@ -43,7 +43,31 @@ namespace heir {
 
 namespace {
 
-// Look up Value / FailureOr<Value> 
+// Look up Value / FailureOr<Value>
+
+static FailureOr<Value> addTensors(Location loc, Value input1, Value input2, PatternRewriter &rewriter){
+    auto input1Type = dyn_cast<RankedTensorType>(input1.getType());
+    auto input2Type = dyn_cast<RankedTensorType>(input2.getType());
+
+    if (!input1Type || !input2Type)
+        return failure();
+
+    if (input1Type.getShape() != input2Type.getShape() || input1Type.getElementType() != input2Type.getElementType())
+        return failure();
+
+    auto outputType = input2Type; 
+
+    Value init = rewriter.create<tensor::EmptyOp>(loc, outputType.getShape(), outputType.getElementType()); 
+
+    auto kindAttr = linalg::ElementwiseKindAttr::get(rewriter.getContext(), linalg::ElementwiseKind::add); 
+
+    auto addOp = rewriter.create<linalg::ElementwiseOp>(loc, ValueRange{input1, input2}, ValueRange{init}, 
+            ArrayRef<NamedAttribute>{rewriter.getNamedAttr("kind", kindAttr)});
+
+    return addOp.getResult(0);
+
+}
+
 static FailureOr<Value> conjugateTensor(Location loc, Value input, PatternRewriter &rewriter){
     auto inputType = dyn_cast<RankedTensorType>(input.getType()); // look up dyn_cast / cast? 
     auto outputType = inputType; 
@@ -51,8 +75,8 @@ static FailureOr<Value> conjugateTensor(Location loc, Value input, PatternRewrit
     // What does this do? 
     auto result = rewriter.create<tensor::EmptyOp>(loc, outputType.getShape(), outputType.getElementType());
 
-    auto zero = rewriter.create<arith::ConstantOp>(loc, outputType, 
-            DenseElementsAttr::get(outputType, rewriter.getZeroAttr(outputType.getElementType()))); 
+    //auto zero = rewriter.create<arith::ConstantOp>(loc, outputType, 
+    //        DenseElementsAttr::get(outputType, rewriter.getZeroAttr(outputType.getElementType()))); 
 
     // Using linalg.generic to apply complex.conj element wise. Look up the working of linalg.generic 
     SmallVector<utils::IteratorType> iteratorTypes(inputType.getRank(), utils::IteratorType::parallel); // what does this do?
@@ -60,12 +84,12 @@ static FailureOr<Value> conjugateTensor(Location loc, Value input, PatternRewrit
     SmallVector<AffineMap> indexingMaps = {
         rewriter.getMultiDimIdentityMap(inputType.getRank()), 
         rewriter.getMultiDimIdentityMap(inputType.getRank())
-    } // check what  this does 
+    }; // check what  this does 
     
-    auto generic = rewriter.create<linalg::GenericOp>(loc, outputType, ValueRange{input}, ValueRange{zero},
+    auto generic = rewriter.create<linalg::GenericOp>(loc, outputType, ValueRange{input}, ValueRange{result},
             indexingMaps, iteratorTypes, 
             [&](OpBuilder &builder, Location loc, ValueRange args){
-                Value conj == builder.create<complex::ConjOp>(loc, args[0]);
+                Value conj = builder.create<complex::ConjOp>(loc, args[0]);
                 builder.create<linalg::YieldOp>(loc, conj);
             });
 
@@ -278,12 +302,12 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         auto xType = dyn_cast<RankedTensorType>(X.getType()); // TODO add checks  
         auto aType = dyn_cast<RankedTensorType>(Acomp.getType()); // TODO add checks 
 
-        int64_t rows = xType.getDimSize(0); 
-        int64_t cols = aType.getDimSize(1); 
+        int64_t rowsXA = xType.getDimSize(0); 
+        int64_t colsXA = aType.getDimSize(1); 
         
         auto complexType = dyn_cast<ComplexType>(aType.getElementType()); // TODO add checks 
 
-        auto xaType = RankedTensorType::get({rows, cols, complexType}); 
+        auto xaType = RankedTensorType::get({rowsXA, colsXA}, complexType); 
         Value xaInit = rewriter.create<tensor::EmptyOp>(loc, xaType.getShape(), xaType.getElementType());
         auto matmulXAcomp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{X, Acomp}, ValueRange{xaInit});
 
@@ -294,12 +318,12 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         auto yType = dyn_cast<RankedTensorType>(Y.getType()); // TODO add checks 
         auto bType = dyn_cast<RankedTensorType>(Bcomp.getType()); // TODO add checks 
 
-        int64_t rows = yType.getDimSize(0); 
-        int64_t cols = bType.getDimSize(1); 
+        int64_t rowsYB = yType.getDimSize(0); 
+        int64_t colsYB = bType.getDimSize(1); 
         
-        auto complexType = dyn_cast<ComplexType>(bType.getElementType()); // TODO add checks 
+        //auto complexType = dyn_cast<ComplexType>(bType.getElementType()); // TODO add checks 
 
-        auto ybType = RankedTensorType::get({rows, cols, complexType}); 
+        auto ybType = RankedTensorType::get({rowsYB, colsYB}, complexType); 
         Value ybInit = rewriter.create<tensor::EmptyOp>(loc, ybType.getShape(), ybType.getElementType());
         auto matmulYBcomp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{Y, Bcomp}, ValueRange{ybInit});
 
@@ -320,7 +344,7 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         // TODO Check if this works the same way for batched matmul
         auto transposeYBcomp = rewriter.create<linalg::TransposeOp>(loc, YBcomp, transposedInit, ArrayRef<int64_t>{1, 0});
 
-        Value YBcompTranposed = transposeYBcomp.getResult(0);
+        Value YBcompTranposed = transposeYBcomp.getResult().front();
 
         // M = XA_comp(YB_comp)^T
         auto xaResultType = dyn_cast<RankedTensorType>(XAcomp.getType()); // TODO add checks
@@ -333,7 +357,7 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         Value outputInit = rewriter.create<tensor::EmptyOp>(loc, outputType.getShape(), outputType.getElementType());
 
         auto matmul3comp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{XAcomp, YBcompTranposed}, ValueRange{outputInit});
-        Value M = matmul.getResult(0);
+        Value M = matmul3comp.getResult(0);
 
         // conj(M)
 
@@ -345,11 +369,12 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         Value conjugated = *conjugateM; 
 
         // (M + conj(M))
-        auto mType = dyn_cast<RankedTensorType>(M.getType());
+        FailureOr<Value> sumResult = addTensors(loc, M, conjugated, rewriter);
+        
+        if (failed(sumResult))
+            return failure();
 
-        Value initSum = rewriter.create<tensor::EmptyOp>(loc, mType.getShape(), mType.getElementType());
-
-        Value sum = rewriter.create<linalg::AddOp>(locc, ValueRange{M, conjugated}, ValueRange{initSum}).getResult(0);
+        Value sum = *sumResult;
 
         // real(sum)
         FailureOr<Value> realResult = extractRealParts(loc, sum, rewriter);
@@ -367,7 +392,6 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
 
         // replace original matmul3 
         rewriter.replaceOp(matmul3, result); 
-
 
         return success();
 
