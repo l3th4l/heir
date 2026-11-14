@@ -43,9 +43,9 @@ namespace heir {
 
 namespace {
 
-// Why not FailureOr? 
-static Value conjugateTensor(Location loc, Value input, PatternRewriter &rewriter){
-    auto inputType = cast<RankedTensorType>(input.getType()); // why not dyn_cast? 
+// Look up Value / FailureOr<Value> 
+static FailureOr<Value> conjugateTensor(Location loc, Value input, PatternRewriter &rewriter){
+    auto inputType = dyn_cast<RankedTensorType>(input.getType()); // look up dyn_cast / cast? 
     auto outputType = inputType; 
     
     // What does this do? 
@@ -71,6 +71,45 @@ static Value conjugateTensor(Location loc, Value input, PatternRewriter &rewrite
 
     return generic.getResult(0);
 }
+
+// Extract the real parts from a complex tensor 
+static FailureOr<Value> extractRealParts(
+    Location loc, Value input, PatternRewriter &rewriter) {
+
+    auto inputType = dyn_cast<RankedTensorType>(input.getType());
+    
+    if (!inputType || !inputType.hasStaticShape())
+        return failure();
+
+    auto complexType = dyn_cast<ComplexType>(inputType.getElementType());
+
+    if (!complexType)
+        return failure();
+
+    Type floatType = complexType.getElementType();
+
+    auto outputType = RankedTensorType::get(inputType.getShape(), floatType);
+
+    Value init = rewriter.create<tensor::EmptyOp>(loc, outputType.getShape(), floatType);
+
+    SmallVector<utils::IteratorType> iteratorTypes(inputType.getRank(), utils::IteratorType::parallel);
+
+    SmallVector<AffineMap> indexingMaps = {
+        rewriter.getMultiDimIdentityMap(inputType.getRank()),
+        rewriter.getMultiDimIdentityMap(inputType.getRank())
+    };
+
+    auto generic = rewriter.create<linalg::GenericOp>(loc, TypeRange{outputType}, ValueRange{input}, ValueRange{init},
+        indexingMaps, iteratorTypes,
+        [&](OpBuilder &builder, Location loc, ValueRange args) {
+            Value real = builder.create<complex::ReOp>(
+                loc, args[0]);
+
+            builder.create<linalg::YieldOp>(loc, real);
+        });
+
+    return generic.getResult(0);
+};
 
 static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &rewriter, 
         bool negateImag = false){
@@ -231,29 +270,104 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         Value Acomp = *packedAResult;
         Value Bcomp = *packedBResult;
 
-        // Replace A with Acomp in the first matmul.
-        rewriter.modifyOpInPlace(matmulXA, [&]() {
-            matmulXA.getDpsInputsMutable()[1].assign(Acomp);
-        });
+        // rebuild matmul3 with newly constructed tensors (Check later if replacing
+        // in place would work) 
 
-        // Replace B with Bcomp in the second matmul.
-        rewriter.modifyOpInPlace(matmulYB, [&]() {
-            matmulYB.getDpsInputsMutable()[1].assign(Bcomp);
-        });
+        // XA -> XA_comp 
 
-        ModuleOp module = matmul3->getParentOfType<ModuleOp>();
+        auto xType = dyn_cast<RankedTensorType>(X.getType()); // TODO add checks  
+        auto aType = dyn_cast<RankedTensorType>(Acomp.getType()); // TODO add checks 
+
+        int64_t rows = xType.getDimSize(0); 
+        int64_t cols = aType.getDimSize(1); 
         
-        llvm::errs() << "Acomp type: " << Acomp.getType() << "\n";
-        llvm::errs() << "Bcomp type: " << Bcomp.getType() << "\n\n";
+        auto complexType = dyn_cast<ComplexType>(aType.getElementType()); // TODO add checks 
 
-        Acomp.getDefiningOp()->dump();
-        Bcomp.getDefiningOp()->dump();
+        auto xaType = RankedTensorType::get({rows, cols, complexType}); 
+        Value xaInit = rewriter.create<tensor::EmptyOp>(loc, xaType.getShape(), xaType.getElementType());
+        auto matmulXAcomp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{X, Acomp}, ValueRange{xaInit});
 
-        module.dump();
+        Value XAcomp = matmulXAcomp.getResult(0);
+
+        // YB -> YB_comp 
+        
+        auto yType = dyn_cast<RankedTensorType>(Y.getType()); // TODO add checks 
+        auto bType = dyn_cast<RankedTensorType>(Bcomp.getType()); // TODO add checks 
+
+        int64_t rows = yType.getDimSize(0); 
+        int64_t cols = bType.getDimSize(1); 
+        
+        auto complexType = dyn_cast<ComplexType>(bType.getElementType()); // TODO add checks 
+
+        auto ybType = RankedTensorType::get({rows, cols, complexType}); 
+        Value ybInit = rewriter.create<tensor::EmptyOp>(loc, ybType.getShape(), ybType.getElementType());
+        auto matmulYBcomp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{Y, Bcomp}, ValueRange{ybInit});
+
+        Value YBcomp = matmulYBcomp.getResult(0);
+
+        // YB_comp -> (YB_comp)^T 
+
+        auto ybResultType = dyn_cast<RankedTensorType>(YBcomp.getType()); // TODO add checks 
+
+        int64_t transposedRows = ybResultType.getDimSize(1); 
+        int64_t transposedCols = ybResultType.getDimSize(0); 
+
+        auto ybTransposedType = RankedTensorType::get({transposedRows, transposedCols}, ybResultType.getElementType());
+
+        Value transposedInit = rewriter.create<tensor::EmptyOp>(loc, ybTransposedType.getShape(),
+                ybTransposedType.getElementType());
+
+        // TODO Check if this works the same way for batched matmul
+        auto transposeYBcomp = rewriter.create<linalg::TransposeOp>(loc, YBcomp, transposedInit, ArrayRef<int64_t>{1, 0});
+
+        Value YBcompTranposed = transposeYBcomp.getResult(0);
+
+        // M = XA_comp(YB_comp)^T
+        auto xaResultType = dyn_cast<RankedTensorType>(XAcomp.getType()); // TODO add checks
+        auto ybtransResultType = dyn_cast<RankedTensorType>(YBcompTranposed.getType()); // TODO add checks
+
+        int64_t outputRows = xaResultType.getDimSize(0); 
+        int64_t outputCols = ybtransResultType.getDimSize(1);
+
+        auto outputType = RankedTensorType::get({outputRows, outputCols}, xaResultType.getElementType());
+        Value outputInit = rewriter.create<tensor::EmptyOp>(loc, outputType.getShape(), outputType.getElementType());
+
+        auto matmul3comp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{XAcomp, YBcompTranposed}, ValueRange{outputInit});
+        Value M = matmul.getResult(0);
+
+        // conj(M)
+
+        FailureOr<Value> conjugateM = conjugateTensor(loc, M, rewriter); 
+
+        if(failed(conjugateM))
+            return failure(); 
+
+        Value conjugated = *conjugateM; 
+
+        // (M + conj(M))
+        auto mType = dyn_cast<RankedTensorType>(M.getType());
+
+        Value initSum = rewriter.create<tensor::EmptyOp>(loc, mType.getShape(), mType.getElementType());
+
+        Value sum = rewriter.create<linalg::AddOp>(locc, ValueRange{M, conjugated}, ValueRange{initSum}).getResult(0);
+
+        // real(sum)
+        FailureOr<Value> realResult = extractRealParts(loc, sum, rewriter);
+
+        if(failed(realResult))
+            return failure();
 
         // TODO we need to propagate the shape and type of the modified operations 
         // since the input and output types and shapes of future operators might 
         // have to be changed. 
+        // NOTE : We only need to do this if we yield a complex tensor instead of 
+        // a real one
+        
+        Value result = *realResult; 
+
+        // replace original matmul3 
+        rewriter.replaceOp(matmul3, result); 
+
 
         return success();
 
