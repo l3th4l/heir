@@ -337,6 +337,11 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         
         Location loc = matmul3.getLoc(); 
         
+        // TODO In the final version we need the input secret tensors 
+        // to be complex and we need to check that their imaginary parts are 0 
+        // not sure if this needs to be done in place or if it's okay to convert
+        // to complex later
+
         FailureOr<Value> xComplexResult = convertToComplexTensor(loc, X, rewriter);
         FailureOr<Value> yComplexResult = convertToComplexTensor(loc, Y, rewriter);
 
