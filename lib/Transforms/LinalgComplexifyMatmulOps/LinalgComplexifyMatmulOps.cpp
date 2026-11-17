@@ -187,32 +187,35 @@ static FailureOr<Value> extractRealParts(Location loc, Value input, PatternRewri
 };
 
 static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &rewriter, 
-        bool negateImag = false){
+        int axis = 1, bool negateImag = false){
     auto inputType = dyn_cast<RankedTensorType>(input.getType()); 
     
     // TODO Figure out what to do in case of batched matmul 
-    if (!inputType || inputType.getRank() != 2 || !inputType.hasStaticShape()){
+    if (!inputType || inputType.getRank() != 2 || !inputType.hasStaticShape() || (axis !=0 && axis != 1))
         return failure();
-    }
 
     auto elemType = dyn_cast<FloatType>(inputType.getElementType());
 
-    if (!elemType){
-        return failure(); 
-    }
+    if (!elemType)
+        return failure();
 
     int64_t rows = inputType.getDimSize(0);
     int64_t cols = inputType.getDimSize(1);
+    
+    int64_t packedSize = (inputType.getDimSize(axis) + 1) / 2;
+
+    int64_t outputRows = axis == 0 ? packedSize : rows; 
+    int64_t outputCols = axis == 1 ? packedSize : cols;
+
+    int64_t axisSize = inputType.getDimSize(axis);
 
     // ceil(cols/2) : accounts for odd number of columns 
     // TODO Figure out what to do if the elements are already complex 
     // Possibly add a check to see if the imaginary parts are all 0
-
-    int64_t packedCols = (cols + 1) / 2; 
-
+   
     auto complexType = ComplexType::get(elemType);
 
-    auto packedType = RankedTensorType::get({rows, packedCols}, complexType); 
+    auto packedType = RankedTensorType::get({outputRows, outputCols}, complexType); 
 
     Value packed = rewriter.create<tensor::GenerateOp>(
             loc, packedType, ValueRange{}, 
@@ -221,25 +224,31 @@ static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &
                 Value row = indices[0]; 
                 Value col = indices[1];
 
+                // Select the index along the axis being packed 
+                Value packedIndex = axis == 0 ? row : col;
+
                 // real component : input[row][col]
                 Value real = builder.create<tensor::ExtractOp>(loc, input, ValueRange{row, col});
 
-                // imagnary component : input[row, col + packedCols]
-                Value offset = builder.create<arith::ConstantIndexOp>(loc, packedCols); 
+                // imagnary component 
+                Value offset = builder.create<arith::ConstantIndexOp>(loc, packedSize); 
 
-                Value secondCol = builder.create<arith::AddIOp>(loc, col, offset); 
+                Value secondIndex = builder.create<arith::AddIOp>(loc, packedIndex, offset); 
 
-                Value bound = builder.create<arith::ConstantIndexOp>(loc, cols);
+                Value bound = builder.create<arith::ConstantIndexOp>(loc, axisSize);
 
-                Value inBounds = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, secondCol, bound);
+                Value inBounds = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, secondIndex, bound);
 
                 // Only extract the imaginary component when index in bounds, else set the imaginary component to 0 
                 auto ifOp = builder.create<scf::IfOp>(loc, TypeRange{elemType}, inBounds, /*withElseRegion=*/true);
-                {
+                {   
+                    Value secondRow = axis == 0 ? secondIndex : row;
+                    Value secondCol = axis == 1 ? secondIndex : col;
+
                     OpBuilder::InsertionGuard guard(builder); 
                     builder.setInsertionPointToStart(&ifOp.getThenRegion().front()); 
 
-                    Value imag = builder.create<tensor::ExtractOp>(loc, input, ValueRange{row, secondCol});
+                    Value imag = builder.create<tensor::ExtractOp>(loc, input, ValueRange{secondRow, secondCol});
 
                     builder.create<scf::YieldOp>(loc, imag);
                 }
@@ -252,12 +261,11 @@ static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &
                     builder.create<scf::YieldOp>(loc, zero);
                 }
 
-                Value imag = ifOp.getResult(0); 
+                Value imag = ifOp.getResult(0);
 
                 // Optionally, negate the imaginary component
-                if (negateImag) {
+                if (negateImag)
                     imag = builder.create<arith::NegFOp>(loc, imag);
-                }
 
                 Value z = builder.create<complex::CreateOp>(loc, complexType, real, imag); 
 
@@ -351,8 +359,8 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         Value Xcomp = *xComplexResult;
         Value Ycomp = *yComplexResult;
 
-        FailureOr<Value> packedAResult = packColumns(loc, A, rewriter, false); 
-        FailureOr<Value> packedBResult = packColumns(loc, B, rewriter, true);  
+        FailureOr<Value> packedAResult = packColumns(loc, A, rewriter, 1, false); 
+        FailureOr<Value> packedBResult = packColumns(loc, B, rewriter, 1, true);  
 
         if (failed(packedAResult) || failed(packedBResult)) 
             return failure();
