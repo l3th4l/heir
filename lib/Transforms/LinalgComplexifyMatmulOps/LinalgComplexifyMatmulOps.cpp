@@ -372,9 +372,22 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         int64_t colsXA = aType.getDimSize(1); 
         
         auto complexType = dyn_cast<ComplexType>(aType.getElementType()); // TODO add checks 
+        auto floatType = complexType.getElementType();
+
+        Value zeroFloat = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getZeroAttr(floatType));
+
+        Value zeroComplex = rewriter.create<complex::CreateOp>(
+            loc, complexType, zeroFloat, zeroFloat); 
 
         auto xaType = RankedTensorType::get({rowsXA, colsXA}, complexType); 
-        Value xaInit = rewriter.create<tensor::EmptyOp>(loc, xaType.getShape(), xaType.getElementType());
+        
+        Value xaEmpty = rewriter.create<tensor::EmptyOp>(
+            loc, xaType.getShape(), xaType.getElementType());
+
+        Value xaInit = rewriter.create<linalg::FillOp>(
+            loc, ValueRange{zeroComplex}, ValueRange{xaEmpty}).result();        
+       
         auto matmulXAcomp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{Xcomp, Acomp}, ValueRange{xaInit});
 
         Value XAcomp = matmulXAcomp.getResult(0);
@@ -390,7 +403,15 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         //auto complexType = dyn_cast<ComplexType>(bType.getElementType()); // TODO add checks 
 
         auto ybType = RankedTensorType::get({rowsYB, colsYB}, complexType); 
-        Value ybInit = rewriter.create<tensor::EmptyOp>(loc, ybType.getShape(), ybType.getElementType());
+
+        // Value ybInit = rewriter.create<tensor::EmptyOp>(loc, ybType.getShape(), ybType.getElementType());
+
+        Value ybEmpty = rewriter.create<tensor::EmptyOp>(
+            loc, ybType.getShape(), ybType.getElementType());
+        
+        Value ybInit = rewriter.create<linalg::FillOp>(
+            loc, ValueRange{zeroComplex}, ValueRange{ybEmpty}).result();
+
         auto matmulYBcomp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{Ycomp, Bcomp}, ValueRange{ybInit});
 
         Value YBcomp = matmulYBcomp.getResult(0);
@@ -420,7 +441,13 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         int64_t outputCols = ybtransResultType.getDimSize(1);
 
         auto outputType = RankedTensorType::get({outputRows, outputCols}, xaResultType.getElementType());
-        Value outputInit = rewriter.create<tensor::EmptyOp>(loc, outputType.getShape(), outputType.getElementType());
+        //Value outputInit = rewriter.create<tensor::EmptyOp>(loc, outputType.getShape(), outputType.getElementType());
+        
+        Value outputEmpty = rewriter.create<tensor::EmptyOp>(
+            loc, outputType.getShape(), outputType.getElementType());
+        
+        Value outputInit = rewriter.create<linalg::FillOp>(
+            loc, ValueRange{zeroComplex}, ValueRange{outputEmpty}).result();
 
         auto matmul3comp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{XAcomp, YBcompTranposed}, ValueRange{outputInit});
         Value M = matmul3comp.getResult(0);
