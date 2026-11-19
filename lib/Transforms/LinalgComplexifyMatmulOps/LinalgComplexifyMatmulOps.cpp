@@ -107,6 +107,7 @@ static FailureOr<Value> conjugateTensor(Location loc, Value input, PatternRewrit
                 builder.create<linalg::YieldOp>(loc, conj);
             });
 
+    generic->setAttr("heir.zero_imaginary", rewriter.getUnitAttr());
     return generic.getResult(0);
 }
 
@@ -183,7 +184,113 @@ static FailureOr<Value> extractRealParts(Location loc, Value input, PatternRewri
             builder.create<linalg::YieldOp>(loc, real);
         });
 
+    generic->setAttr("heir.extract_real_parts",rewriter.getUnitAttr());
     return generic.getResult(0);
+};
+
+static bool hasZeroImaginaryPart(Value input) {
+
+    auto tensorType = dyn_cast<RankedTensorType>(input.getType());
+
+    if (!tensorType || !tensorType.hasStaticShape())
+        return false;
+
+    auto complexType =dyn_cast<ComplexType>(tensorType.getElementType());
+
+    if (!complexType)
+        return false;
+
+    Operation *definingOp = input.getDefiningOp();
+    if (!definingOp)
+        return false;
+
+    // Stage 1: Check the zero-imaginary attribute.
+    if (definingOp->hasAttr("heir.zero_imaginary"))
+        return true;
+
+    // Stage 2: Inspect the defining operation's construction.
+    if (auto generic = dyn_cast<linalg::GenericOp>(definingOp)) {
+
+        auto yield = dyn_cast<linalg::YieldOp>(generic.getRegion().front().getTerminator());
+
+        if (yield) {
+            auto create = yield.getValues().front().getDefiningOp<complex::CreateOp>();
+
+            if (create) {
+                Value imag = create.getImag();
+
+                if (auto constant = imag.getDefiningOp<arith::ConstantOp>()) {
+
+                    auto floatAttr = dyn_cast<FloatAttr>(constant.getValue());
+
+                    if (floatAttr)
+                        return floatAttr.getValue().isZero();
+
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Stage 3: Inspect compile-time tensor constants.
+    // TODO If this is an unnecessary performance overhead, remove this 
+    if (auto constant = dyn_cast<arith::ConstantOp>(definingOp)) {
+        auto denseAttr = dyn_cast<DenseElementsAttr>(constant.getValue());
+
+        if (!denseAttr)
+            return false;
+
+        for (Attribute element : denseAttr.getValues<Attribute>()) {
+            auto complexAttr = dyn_cast< complex::NumberAttr >(element);
+
+            if (!complexAttr)
+                return false;
+
+            if (!complexAttr.getImaginary().isZero())
+                return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+static FailureOr<Value> getComplexTensor(Location loc, Value input, PatternRewriter &rewriter) {
+
+    auto inputType = dyn_cast<RankedTensorType>(input.getType());
+
+    if (!inputType || !inputType.hasStaticShape())
+        return failure();
+
+    Type elementType = inputType.getElementType();
+
+    // Case 1: Input is already complex.
+    if (isa<ComplexType>(elementType)) {
+        //TODO need to construct hasZeroImaginaryPart
+        if (hasZeroImaginaryPart(input))
+            return input;
+
+        return failure();
+    }
+
+    // Case 2: Input was produced by extractRealParts().
+    if (auto generic = input.getDefiningOp<linalg::GenericOp>()) {
+        if (generic->hasAttr("heir.extract_real_parts")) {
+
+            Value originalComplex = generic.getDpsInputs()[0];
+
+            if (hasZeroImaginaryPart(originalComplex))
+                return originalComplex;
+
+            // Original complex tensor has nonzero imaginary parts.
+            // Treat the extracted real tensor as an ordinary real tensor.
+        }
+    }
+
+    // Case 3: Ordinary real-valued input.
+    if (isa<FloatType>(elementType))
+        return convertToComplexTensor(loc, input, rewriter);
+
+    return failure();
 };
 
 static FailureOr<Value> packColumns(Location loc, Value input, PatternRewriter &rewriter, 
@@ -500,7 +607,182 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
 };
 
 // TODO Transforms B(XA)C : Free Attenetion Complexification
+// initially we take into account (B(XA))C 
+// equivalent of (BX)(AC), B(X(AC)), B((XA)C)
+struct ComplexifyRightLeftRightMultiplication: public OpRewritePattern<linalg::MatmulOp>{
+    const DataFlowSolver *solver; 
 
+    ComplexifyRightLeftRightMultiplication(
+            MLIRContext *context, 
+            const DataFlowSolver *solver)
+            : mlir::OpRewritePattern<linalg::MatmulOp>(context), 
+              solver(solver) {}
+    
+    LogicalResult matchAndRewrite(linalg::MatmulOp matmul3,
+                                  PatternRewriter &rewriter) const override{
+        
+        // Outer matmul: (B(XA)) * C 
+        Value lhs = matmul3.getDpsInputs()[0]; 
+        Value C = matmul3.getDpsInputs()[1]; 
+
+        // Middle matmul: B * (XA)
+        auto matmul2 = lhs.getDefiningOp<linalg::MatmulOp>();
+        if (!matmul2)
+            return failure();
+
+        Value B = matmul2.getDpsInputs()[0];
+        Value innerRhs = matmul2.getDpsInputs()[1];
+        
+        // Inner matmul: X * A
+        auto matmul1 = innerRhs.getDefiningOp<linalg::MatmulOp>();
+        if (!matmul1)
+            return failure();
+
+        Value X = matmul1.getDpsInputs()[0];         
+        Value A = matmul1.getDpsInputs()[1];
+
+        // checks that X is a ssecret tensors and A, C aren't 
+        
+        bool xSecret = isSecret(X, solver);
+        
+        bool aSecret = isSecret(A, solver); 
+        bool cSecret = isSecret(C, solver);
+
+        if (!xSecret || aSecret || cSecret)
+            return failure();
+        
+        Location loc = matmul3.getLoc(); 
+
+        FailureOr<Value> xComplexResult = convertToComplexTensor(loc, X, rewriter);
+        
+        // if B is already complex with imaginary parts 0, we do nothing. If its imaginary parts are 
+        // not 0, we return failure. 
+        // If B comes from an extractRealParts, which has a complex tensor as operand with imaginary parts all 0, 
+        // we remove the extractRealParts operration. If it's imagiinary parts are not 0, then we treat this as a 
+        // normal real-only valued tensor 
+        // For real-only valued tensor, we use the convertToComplexTensor function
+        // This is implemented in the function getComplexTensor()
+
+        FailureOr<Value> bComplexResult = getComplexTensor(loc, B, rewriter)
+
+        if (failed(xComplexResult) || failed(bComplexResult))
+            return failure();
+
+        Value Xcomp = *xComplexResult;
+        Value Bcomp = *bComplexResult;
+
+        FailureOr<Value> packedAResult = packColumns(loc, A, rewriter, 1, true); 
+        FailureOr<Value> packedCResult = packColumns(loc, C, rewriter, 0, false);  
+
+        if (failed(packedAResult) || failed(packedCResult)) 
+            return failure();
+
+        Value Acomp = *packedAResult;
+        Value Ccomp = *packedCResult;
+
+        // rebuild matmul3 with newly constructed tensors (Check later if replacing
+        // in place would work) 
+
+        // XA -> XA_comp 
+
+        auto xType = dyn_cast<RankedTensorType>(Xcomp.getType()); // TODO add checks  
+        auto aType = dyn_cast<RankedTensorType>(Acomp.getType()); // TODO add checks 
+
+        int64_t rowsXA = xType.getDimSize(0); 
+        int64_t colsXA = aType.getDimSize(1); 
+        
+        auto complexType = dyn_cast<ComplexType>(aType.getElementType()); // TODO add checks 
+        auto floatType = complexType.getElementType();
+
+        Value zeroFloat = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getZeroAttr(floatType));
+
+        Value zeroComplex = rewriter.create<complex::CreateOp>(
+            loc, complexType, zeroFloat, zeroFloat); 
+
+        auto xaType = RankedTensorType::get({rowsXA, colsXA}, complexType); 
+        
+        Value xaEmpty = rewriter.create<tensor::EmptyOp>(
+            loc, xaType.getShape(), xaType.getElementType());
+
+        Value xaInit = rewriter.create<linalg::FillOp>(
+            loc, ValueRange{zeroComplex}, ValueRange{xaEmpty}).result();        
+       
+        auto matmul1Comp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{Xcomp, Acomp}, ValueRange{xaInit}).getResult(0);
+        
+        // matmul2Comp = B * matmul1Comp 
+        auto bType = dyn_cast<RankedTensorType>(Bcomp.getType()); // TODO add checks 
+        auto matmul1CompType = dyn_cast<RankedTensorType>(matmul1Comp.getType()); // TODO add checks. Is this line redundant?  
+
+        int64_t rowsMatmul2 = bType.getDimSize(0);
+        int64_t colsMatmul2 = matmul1CompType.getDimSize(1);
+
+        auto matmul2Type = RankedTensorType::get({rowsMatmul2, colsMatmul2}, complexType);
+
+        Value matmul2Empty = rewriter.create<tensor::EmptyOp>(
+            loc, matmul2Type.getShape(), matmul2Type.getElementType());
+
+        Value matmul2Init = rewriter.create<linalg::FillOp>(
+            loc, ValueRange{zeroComplex}, ValueRange{matmul2Empty}).result();  
+
+        auto matmul2Comp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{Bcomp, matmul1Comp}, ValueRange{matmul2Init}).getResult(0);
+
+        // matmul3Comp = matmul2Comp * C 
+        auto matmul2CompType = dyn_cast<RankedTensorType>(matmul2Comp.getType()); // TODO add checks. Is this line redundant?  
+        auto cType = dyn_cast<RankedTensorType>(Ccomp.getType()); // TODO add checks 
+        
+        int64_t rowsMatmul3 = matmul2CompType.getDimSize(0);
+        int64_t colsMatmul3 = cType.getDimSize(1);
+
+        auto matmul3Type = RankedTensorType::get({rowsMatmul3, colsMatmul3}, complexType);
+
+        Value matmul3Empty = rewriter.create<tensor::EmptyOp>(
+            loc, matmul3Type.getShape(), matmul3Type.getElementType());
+
+        Value matmul3Init = rewriter.create<linalg::FillOp>(
+            loc, ValueRange{zeroComplex}, ValueRange{matmul3Empty}).result();  
+
+        auto matmul3Comp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{matmul2Comp, Ccomp}, ValueRange{matmul3Init}).getResult(0);
+        Value M = matmul3comp;
+
+        // conj(M)
+
+        FailureOr<Value> conjugateM = conjugateTensor(loc, M, rewriter); 
+
+        if(failed(conjugateM))
+            return failure(); 
+
+        Value conjugated = *conjugateM; 
+
+        // (M + conj(M))
+        FailureOr<Value> sumResult = addTensors(loc, M, conjugated, rewriter);
+        
+        if (failed(sumResult))
+            return failure();
+
+        Value sum = *sumResult;
+
+        // real(sum)
+        FailureOr<Value> realResult = extractRealParts(loc, sum, rewriter);
+
+        if(failed(realResult))
+            return failure();
+
+        // TODO we need to propagate the shape and type of the modified operations 
+        // since the input and output types and shapes of future operators might 
+        // have to be changed. 
+        // NOTE : We only need to do this if we yield a complex tensor instead of 
+        // a real one
+        
+        Value result = *realResult; 
+
+        // replace original matmul3 
+        rewriter.replaceOp(matmul3, result); 
+
+        return success();
+
+    }
+};
 
 // TODO Transforms AB + CD -> (A + Ci)(B - Di)
 // TODO Keep on Hold until clarification of FF1 and FF2 complexification 
