@@ -200,6 +200,7 @@ static FailureOr<Value> getComplexTensor(Location loc, Value input, PatternRewri
 
     // Case 1: Input is already complex.
     if (isa<ComplexType>(elementType)) {
+        //TODO Need to check if the imaginary parts for all the elements are 0
         //TODO need to construct hasZeroImaginaryPart
         //if (hasZeroImaginaryPart(input))
         //    return input;
