@@ -149,7 +149,8 @@ static FailureOr<Value> convertToComplexTensor(Location loc, Value input, Patter
     return generic.getResult(0); 
 }
 
-// Extract the real parts from a complex tensor 
+// Extract the real parts from a complex tensor
+// TODO Place the Conjugation Logic here 
 static FailureOr<Value> extractRealParts(Location loc, Value input, PatternRewriter &rewriter){
 
     auto inputType = dyn_cast<RankedTensorType>(input.getType());
@@ -188,72 +189,6 @@ static FailureOr<Value> extractRealParts(Location loc, Value input, PatternRewri
     return generic.getResult(0);
 };
 
-static bool hasZeroImaginaryPart(Value input) {
-
-    auto tensorType = dyn_cast<RankedTensorType>(input.getType());
-
-    if (!tensorType || !tensorType.hasStaticShape())
-        return false;
-
-    auto complexType =dyn_cast<ComplexType>(tensorType.getElementType());
-
-    if (!complexType)
-        return false;
-
-    Operation *definingOp = input.getDefiningOp();
-    if (!definingOp)
-        return false;
-
-    // Stage 1: Check the zero-imaginary attribute.
-    if (definingOp->hasAttr("heir.zero_imaginary"))
-        return true;
-
-    // Stage 2: Inspect the defining operation's construction.
-    if (auto generic = dyn_cast<linalg::GenericOp>(definingOp)) {
-
-        auto yield = dyn_cast<linalg::YieldOp>(generic.getRegion().front().getTerminator());
-
-        if (yield) {
-            auto create = yield.getValues().front().getDefiningOp<complex::CreateOp>();
-
-            if (create) {
-                Value imag = create.getImag();
-
-                if (auto constant = imag.getDefiningOp<arith::ConstantOp>()) {
-
-                    auto floatAttr = dyn_cast<FloatAttr>(constant.getValue());
-
-                    if (floatAttr)
-                        return floatAttr.getValue().isZero();
-
-                    return false;
-                }
-            }
-        }
-    }
-
-    // Stage 3: Inspect compile-time tensor constants.
-    // TODO If this is an unnecessary performance overhead, remove this 
-    if (auto constant = dyn_cast<arith::ConstantOp>(definingOp)) {
-        auto denseAttr = dyn_cast<DenseElementsAttr>(constant.getValue());
-
-        if (!denseAttr)
-            return false;
-
-        for (Attribute element : denseAttr.getValues<Attribute>()) {
-            auto complexAttr = dyn_cast< complex::NumberAttr >(element);
-
-            if (!complexAttr)
-                return false;
-
-            if (!complexAttr.getImaginary().isZero())
-                return false;
-        }
-        return true;
-    }
-    return false;
-}
-
 static FailureOr<Value> getComplexTensor(Location loc, Value input, PatternRewriter &rewriter) {
 
     auto inputType = dyn_cast<RankedTensorType>(input.getType());
@@ -266,8 +201,8 @@ static FailureOr<Value> getComplexTensor(Location loc, Value input, PatternRewri
     // Case 1: Input is already complex.
     if (isa<ComplexType>(elementType)) {
         //TODO need to construct hasZeroImaginaryPart
-        if (hasZeroImaginaryPart(input))
-            return input;
+        //if (hasZeroImaginaryPart(input))
+        //    return input;
 
         return failure();
     }
@@ -278,8 +213,7 @@ static FailureOr<Value> getComplexTensor(Location loc, Value input, PatternRewri
 
             Value originalComplex = generic.getDpsInputs()[0];
 
-            if (hasZeroImaginaryPart(originalComplex))
-                return originalComplex;
+            return originalComplex;
 
             // Original complex tensor has nonzero imaginary parts.
             // Treat the extracted real tensor as an ordinary real tensor.
@@ -568,6 +502,7 @@ struct ComplexifyTransposedMultiplication: public OpRewritePattern<linalg::Matmu
         Value M = matmul3comp.getResult(0);
 
         // conj(M)
+        // TODO Move the Conjugation Logic to extractRealParts
 
         FailureOr<Value> conjugateM = conjugateTensor(loc, M, rewriter); 
 
@@ -663,7 +598,7 @@ struct ComplexifyRightLeftRightMultiplication: public OpRewritePattern<linalg::M
         // For real-only valued tensor, we use the convertToComplexTensor function
         // This is implemented in the function getComplexTensor()
 
-        FailureOr<Value> bComplexResult = getComplexTensor(loc, B, rewriter)
+        FailureOr<Value> bComplexResult = getComplexTensor(loc, B, rewriter);
 
         if (failed(xComplexResult) || failed(bComplexResult))
             return failure();
@@ -743,7 +678,7 @@ struct ComplexifyRightLeftRightMultiplication: public OpRewritePattern<linalg::M
             loc, ValueRange{zeroComplex}, ValueRange{matmul3Empty}).result();  
 
         auto matmul3Comp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{matmul2Comp, Ccomp}, ValueRange{matmul3Init}).getResult(0);
-        Value M = matmul3comp;
+        Value M = matmul3Comp;
 
         // conj(M)
 
@@ -814,6 +749,7 @@ struct LinalgComplexifyMatmulOps
     RewritePatternSet patterns(context);
     // add the rewrite pattern here 
     patterns.add<ComplexifyTransposedMultiplication>(context, &solver);
+    patterns.add<ComplexifyRightLeftRightMultiplication>(context, &solver);
 
     if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
       return signalPassFailure();
